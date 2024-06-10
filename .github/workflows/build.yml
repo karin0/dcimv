@@ -1,0 +1,64 @@
+name: Build
+on: [push, workflow_dispatch]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        target:
+          - aarch64-linux-android
+    env:
+      RUST_BACKTRACE: full
+    runs-on: 'ubuntu-latest'
+    steps:
+      - name: Cleanup pre-installed tools
+        run: |
+          # This is a fix for https://github.com/actions/virtual-environments/issues/1918
+          shopt -s nullglob
+          sudo rm -rf /usr/share/{dotnet,swift,az*,gradle*,*conda} \
+            /opt/{ghc,az} \
+            /usr/local/share/boost /usr/local/graalvm /usr/local/julia* "$AGENT_TOOLSDIRECTORY"
+
+      - uses: actions/checkout@v2
+
+      - uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          default: true
+
+      - run: cargo install cross --git https://github.com/cross-rs/cross
+        continue-on-error: true
+
+      - name: Build ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -e
+          cargo update
+          target=${{ matrix.target }}
+          cross build --release --target $target
+          bin=target/$target/release/dcimv
+          FILE=dcimv-${GITHUB_SHA::7}-$target.xz
+          echo "FILE=$FILE" >> $GITHUB_ENV
+          xz -cv $bin > $FILE
+
+      - uses: actions/upload-artifact@v3
+        with:
+          name: ${{ env.FILE }}
+          path: ${{ env.FILE }}
