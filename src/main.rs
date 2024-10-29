@@ -1,13 +1,16 @@
 use inotify::{Event, EventMask, Inotify, WatchMask};
+use log::Level;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
+use std::ffi::{c_int, OsStr, OsString};
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, MAIN_SEPARATOR_STR};
 use std::{env, fs, io};
 
 #[macro_use]
 extern crate log;
+
+const CWD: &str = "/sdcard/DCIM";
 
 const IMG_EXT_STRS: [&str; 10] = [
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "jxl", "apng",
@@ -16,7 +19,7 @@ const IMG_EXT_STRS: [&str; 10] = [
 static mut IMG_EXTS: BTreeSet<&OsStr> = BTreeSet::new();
 
 fn is_img_dir(dir: &Path) -> bool {
-    dir.components().nth(1).is_some_and(|c| {
+    dir.components().next().is_some_and(|c| {
         c.as_os_str()
             .to_str()
             .is_some_and(|s| s.ends_with("Camera") || s.ends_with("_PRO") || s == "100ANDRO")
@@ -58,8 +61,30 @@ impl Directory {
         r
     }
 
+    fn _join(&self, name: &Path) -> PathBuf {
+        // We join only file names.
+        let mut p = self.path.clone();
+        let s = p.as_mut_os_string();
+        s.push(MAIN_SEPARATOR_STR);
+        s.push(name);
+        p
+    }
+
     pub fn join(&self, name: &Path) -> PathBuf {
-        self.path.join(name)
+        // Omit leading `./` in the paths.
+        if self.path == Path::new(".") {
+            name.to_path_buf()
+        } else {
+            self._join(name)
+        }
+    }
+
+    pub fn join_owned(&self, name: OsString) -> PathBuf {
+        if self.path == Path::new(".") {
+            PathBuf::from(name)
+        } else {
+            self._join(name.as_ref())
+        }
     }
 
     pub fn filter_name(&self, name: &Path) -> bool {
@@ -78,7 +103,7 @@ impl Directory {
     }
 }
 
-type Dirs = BTreeMap<i32, Directory>;
+type Dirs = BTreeMap<c_int, Directory>;
 
 #[derive(Debug)]
 struct Monitor {
@@ -103,7 +128,7 @@ impl Monitor {
         }
     }
 
-    fn add(&mut self, dir: PathBuf) -> io::Result<i32> {
+    fn add(&mut self, dir: PathBuf) -> io::Result<c_int> {
         let st = dir.metadata()?;
         if !st.is_dir() {
             return Err(io::Error::new(
@@ -149,7 +174,7 @@ impl Monitor {
         Ok(wd)
     }
 
-    fn remove(&mut self, wd: i32) {
+    fn remove(&mut self, wd: c_int) {
         if let Some(dir) = self.dirs.remove(&wd) {
             if !self.inos.remove(&dir.ino) {
                 error!(
@@ -170,54 +195,35 @@ impl Monitor {
         match self.add(root) {
             Ok(wd) => {
                 let dir = self.dirs.get(&wd).unwrap();
-                if inplace {
-                    let mut sub_dirs = vec![];
-                    for entry in fs::read_dir(dir.path()).unwrap().flatten() {
-                        let name = entry.file_name();
-                        if name.as_encoded_bytes()[0] == b'.' {
-                            continue;
-                        }
+                let mut sub_dirs = vec![];
+                for entry in fs::read_dir(dir.path()).unwrap().flatten() {
+                    let name = entry.file_name();
+                    if name.as_encoded_bytes()[0] == b'.' {
+                        continue;
+                    }
 
-                        if let Ok(typ) = entry.file_type() {
-                            if typ.is_dir() {
-                                sub_dirs.push(entry.path());
-                            } else {
-                                let name = Path::new(name.as_os_str());
-                                if dir.filter_name(name) {
-                                    if let Err(e) = self.emit(dir, name) {
-                                        error!(
-                                            "Error moving {}: {:?}",
-                                            dir.join(name).display(),
-                                            e
-                                        );
-                                    }
+                    if let Ok(typ) = entry.file_type() {
+                        if typ.is_dir() {
+                            sub_dirs.push(dir.join_owned(name));
+                        } else if inplace {
+                            let name = Path::new(name.as_os_str());
+                            if dir.filter_name(name) {
+                                if let Err(e) = self.emit(dir, name, Level::Warn) {
+                                    error!("Error moving {}: {:?}", dir.join(name).display(), e);
                                 }
                             }
                         }
                     }
-                    for sub_dir in sub_dirs {
-                        self.watch(sub_dir, inplace);
-                    }
-                } else {
-                    for entry in fs::read_dir(dir.path()).unwrap().flatten() {
-                        let name = entry.file_name();
-                        if name.as_encoded_bytes()[0] == b'.' {
-                            continue;
-                        }
-
-                        if let Ok(typ) = entry.file_type() {
-                            if typ.is_dir() {
-                                self.watch(entry.path(), inplace);
-                            }
-                        }
-                    }
+                }
+                for sub_dir in sub_dirs {
+                    self.watch(sub_dir, inplace);
                 }
             }
             Err(e) => error!("Error watching: {:?}", e),
         }
     }
 
-    fn find_dir(dirs: &Dirs, wd: i32) -> io::Result<&Directory> {
+    fn find_dir(dirs: &Dirs, wd: c_int) -> io::Result<&Directory> {
         if let Some(dir) = dirs.get(&wd) {
             return Ok(dir);
         }
@@ -227,13 +233,13 @@ impl Monitor {
         ))
     }
 
-    fn emit(&self, dir: &Directory, name: &Path) -> io::Result<()> {
+    fn emit(&self, dir: &Directory, name: &Path, lvl: Level) -> io::Result<()> {
         let mut dst = dir.dst(&self.dest);
         let src = dir.join(name);
         dst.push(name);
 
         if self.dry {
-            info!("Dry run: {} -> {}", src.display(), dst.display());
+            log!(lvl, "Dry run: {} -> {}", src.display(), dst.display());
             return Ok(());
         }
 
@@ -247,7 +253,7 @@ impl Monitor {
         );
 
         fs::rename(&src, &dst)?;
-        info!("Moved {} -> {}", src.display(), dst.display());
+        log!(lvl, "Moved {}", src.display());
         Ok(())
     }
 
@@ -293,8 +299,8 @@ impl Monitor {
                     *slept = true;
                 }
 
-                if let Err(e) = self.emit(dir, name) {
-                    error!("Error moving {}: {:?}", dir.path().join(name).display(), e);
+                if let Err(e) = self.emit(dir, name, Level::Info) {
+                    error!("Error moving {}: {:?}", dir.join(name).display(), e);
                     return Err(e);
                 }
             }
@@ -340,33 +346,58 @@ impl Monitor {
     }
 }
 
+struct Args {
+    dest: PathBuf,
+    dry: bool,
+    inplace: bool,
+}
+
+impl Args {
+    fn new() -> Self {
+        // Consume `argv[0]` first.
+        let mut args = env::args_os();
+        args.next().unwrap();
+
+        // First argument is the destination directory.
+        let dest = PathBuf::from(args.next().unwrap());
+        if !fs::metadata(&dest).unwrap().is_dir() {
+            panic!("Not a directory: {}", dest.display());
+        }
+
+        let args = args.collect::<Vec<_>>();
+        let dry = args.iter().any(|a| a == "-d");
+        let inplace = args.iter().any(|a| a == "-i");
+        let force = args.iter().any(|a| a == "-f");
+
+        if !force {
+            let cwd = env::current_dir().unwrap();
+            if fs::metadata(&cwd).unwrap().ino() != fs::metadata(CWD).unwrap().ino() {
+                panic!("Not in {}: {}", CWD, cwd.display());
+            }
+        }
+
+        Self { dest, dry, inplace }
+    }
+}
+
 fn main() {
     if env::var("RUST_LOG").is_err() {
         env::set_var("RUST_LOG", "info");
     }
     pretty_env_logger::init_timed();
 
-    // Consume `argv[0]` first.
-    let mut args = env::args_os();
-    args.next().unwrap();
-
-    // First argument is the destination, and the rest are watched directories.
-    let dest = PathBuf::from(args.next().unwrap());
-    let root = PathBuf::from(args.next().unwrap());
-    let args = args.collect::<Vec<_>>();
-    let dry = args.iter().any(|a| a == "-d");
-    let inplace = args.iter().any(|a| a == "-i");
-    drop(args);
-
+    let args = Args::new();
     unsafe {
         for s in IMG_EXT_STRS {
             IMG_EXTS.insert(OsStr::new(s));
         }
     }
 
-    let mut m = Monitor::new(dest, dry);
+    let mut m = Monitor::new(args.dest, args.dry);
     debug!("Monitor: {:?}", m);
-    m.watch(root, inplace);
+
+    // Always start from the current directory.
+    m.watch(PathBuf::from("."), args.inplace);
 
     let mut buf = [0; 1024];
     loop {

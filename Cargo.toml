@@ -13,6 +13,11 @@ lto = true
 inherits = "release"
 lto = false
 
+[profile.debuginfo]
+inherits = "release"
+debug = true
+strip = false
+
 [dependencies]
 inotify = { version = "0.11.0", default-features = false }
 log = "0.4"
