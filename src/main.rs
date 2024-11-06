@@ -26,6 +26,10 @@ fn is_img_dir(dir: &Path) -> bool {
     })
 }
 
+fn is_ignored_dir(name: &OsStr, inplace: bool) -> bool {
+    inplace && name.to_str().is_some_and(|s| s.starts_with("DSC_20"))
+}
+
 #[derive(Debug)]
 struct Directory {
     path: PathBuf,
@@ -204,7 +208,11 @@ impl Monitor {
 
                     if let Ok(typ) = entry.file_type() {
                         if typ.is_dir() {
-                            sub_dirs.push(dir.join_owned(name));
+                            if is_ignored_dir(&name, inplace) {
+                                debug!("Ignored: {}", name.to_string_lossy());
+                            } else {
+                                sub_dirs.push(dir.join_owned(name));
+                            }
                         } else if inplace {
                             let name = Path::new(name.as_os_str());
                             if dir.filter_name(name) {
