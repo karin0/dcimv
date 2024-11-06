@@ -1,6 +1,6 @@
 use inotify::{Event, EventMask, Inotify, WatchMask};
 use log::Level;
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_int, OsStr, OsString};
 use std::os::unix::fs::MetadataExt;
@@ -16,7 +16,18 @@ const IMG_EXT_STRS: [&str; 10] = [
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "jxl", "apng",
 ];
 
-static mut IMG_EXTS: BTreeSet<&OsStr> = BTreeSet::new();
+struct Twice<T>(UnsafeCell<T>);
+
+unsafe impl<T: Sync> Sync for Twice<T> {}
+
+impl<T> Twice<T> {
+    #[inline(always)]
+    fn get(&self) -> *mut T {
+        self.0.get()
+    }
+}
+
+static IMG_EXTS: Twice<BTreeSet<&OsStr>> = Twice(UnsafeCell::new(BTreeSet::new()));
 
 fn is_img_dir(dir: &Path) -> bool {
     dir.components().next().is_some_and(|c| {
@@ -99,7 +110,7 @@ impl Directory {
             }
             if !self.allow_img {
                 unsafe {
-                    return IMG_EXTS.contains(ext.as_os_str());
+                    return (*IMG_EXTS.get()).contains(ext.as_os_str());
                 }
             }
             false
@@ -397,7 +408,7 @@ fn main() {
     let args = Args::new();
     unsafe {
         for s in IMG_EXT_STRS {
-            IMG_EXTS.insert(OsStr::new(s));
+            (*IMG_EXTS.get()).insert(OsStr::new(s));
         }
     }
 
